@@ -7,6 +7,11 @@ services:
       POSTGRES_DB: temporal
     volumes:
       - temporal-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U temporal"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
 
   temporal:
     image: temporalio/auto-setup:latest
@@ -19,7 +24,8 @@ services:
       - POSTGRES_PWD=temporal
       - POSTGRES_SEEDS=temporal-db
     depends_on:
-      - temporal-db
+      temporal-db:
+        condition: service_healthy
     healthcheck:
       test: ["CMD", "tctl", "--address", "temporal:7233", "cluster", "health"]
       interval: 10s
