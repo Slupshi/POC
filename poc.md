@@ -4,7 +4,7 @@
 
 ## Objectif
 
-Valider expérimentalement les deux variantes du pattern SAGA (chorégraphie et orchestration) sur un scénario métier concret, afin de déterminer laquelle est la plus adaptée à notre contexte.
+Valider expérimentalement les variantes du pattern SAGA sur un scénario métier concret, afin de déterminer laquelle est la plus adaptée à notre contexte. La Phase 1 se décline en deux sous-variantes pour mesurer apport du **Transactional Outbox Pattern** sur la fiabilité de la chorégraphie.
 
 ---
 
@@ -29,14 +29,16 @@ Les deux chemins à valider :
 
 ---
 
-## 2. Organisation en deux phases
+## 2. Organisation en trois phases
 
 | Phase | Variante | Outil proposé | Objectif |
 |-------|----------|---------------|----------|
-| **Phase 1** | SAGA Chorégraphiée | **RabbitMQ** (via MassTransit) | Valider l'approche event-driven, mesurer la complexité de debug |
+| **Phase 1a** | SAGA Chorégraphiée | **RabbitMQ** (via MassTransit) | Base de référence : approche event-driven sans garantie de publication |
+| **Phase 1b** | SAGA Chorégraphiée + Transactional Outbox | **RabbitMQ** + **EF Core Outbox** (MassTransit) | Mesurer l'apport de l'Outbox sur la fiabilité (élimination du dual-write) |
 | **Phase 2** | SAGA Orchestrée | **Temporal** (.NET SDK) | Valider l'orchestration centralisée, comparer la lisibilité et la résilience |
 
 > **MassTransit** s'intègre nativement avec .NET et supporte les sagas chorégraphiées avec state machine.  
+> Son support natif de l'**Outbox pattern** (via `AddEntityFrameworkOutbox`) simplifie la Phase 1b.  
 > **Temporal** dispose d'un SDK .NET mature et d'un dashboard de monitoring inclus.
 
 ---
@@ -45,7 +47,7 @@ Les deux chemins à valider :
 
 ```
 POC/Api/transactions/
-├── Saga-Choreography/                # Phase 1
+├── Saga-Choreography/                # Phase 1a
 │   ├── src/
 │   │   ├── OrderService/
 │   │   ├── StockService/
@@ -53,6 +55,15 @@ POC/Api/transactions/
 │   │   └── Contracts/                # Events partagés (NuGet interne)
 │   ├── docker-compose.yml            # RabbitMQ + services + BDD
 │   └── README.md                     # Instructions de lancement + scénarios
+│
+├── Saga-Choreography-Outbox/         # Phase 1b (fork de 1a + Outbox)
+│   ├── src/
+│   │   ├── OrderService/             # + table Outbox + migration EF Core
+│   │   ├── StockService/
+│   │   ├── PaymentService/
+│   │   └── Contracts/
+│   ├── docker-compose.yml
+│   └── README.md
 │
 ├── Saga-Orchestration/               # Phase 2
 │   ├── src/
@@ -92,30 +103,40 @@ POC/Api/transactions/
 - Communication synchrone via **gRPC** (cohérent avec ADR-004)
 - Conteneurisation via **Docker Compose**
 
-### Étape 2 — Phase 1 : Chorégraphie
+### Étape 2 — Phase 1a : Chorégraphie (référence)
 
 - Ajouter **RabbitMQ** comme broker de messages
 - Intégrer **MassTransit** avec state machine dans chaque service
 - Implémenter le flux d'événements et les compensations
 - Tester le happy path et le failure path
+- **Ne pas traiter le dual-write** : observer le risque de perte de message en cas de crash
 
-### Étape 3 — Phase 2 : Orchestration
+### Étape 3 — Phase 1b : Chorégraphie + Transactional Outbox
+
+- Forker `Saga-Choreography/` vers `Saga-Choreography-Outbox/`
+- Activer l'Outbox MassTransit via `AddEntityFrameworkOutbox` dans chaque service producteur
+- Ajouter la table `OutboxMessage` (migration EF Core) dans la même BDD que le domaine
+- Vérifier que l'envoi de l'événement et l'écriture métier sont dans la **même transaction locale**
+- Simuler un crash entre la sauvegarde BDD et la publication : valider qu'aucun message n'est perdu
+- Comparer le comportement avec la Phase 1a lors des tests de chaos
+
+### Étape 4 — Phase 2 : Orchestration
 
 - Déployer **Temporal Server** (via Docker)
 - Créer un `SagaOrchestrator` avec workflows Temporal (.NET SDK)
 - Implémenter le même scénario métier via orchestration
 - Tester le happy path et le failure path
 
-### Étape 4 — Tests de chaos
+### Étape 5 — Tests de chaos
 
-Sur les deux variantes, simuler :
+Sur les trois variantes (1a, 1b, 2), simuler :
 
 - **Service down** pendant une saga en cours
 - **Timeout** sur un appel inter-service
 - **Message dupliqué** (rejouer un événement)
 - **Compensation qui échoue** (vérifier le retry / dead-letter)
 
-### Étape 5 — Évaluation comparative
+### Étape 6 — Évaluation comparative
 
 - Remplir la grille de critères dans `EVALUATION.md`
 - Rédiger une recommandation factuelle

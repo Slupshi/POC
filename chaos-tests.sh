@@ -21,10 +21,12 @@ set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CHOR_DIR="$SCRIPT_DIR/Saga-Choreography"
+OUTBOX_DIR="$SCRIPT_DIR/Saga-Choreography-Outbox"
 ORCH_DIR="$SCRIPT_DIR/Saga-Orchestration"
 
 # Ports exposés (docker-compose.yml)
 CHOR_ORDER_URL="http://localhost:5101"
+OUTBOX_ORDER_URL="http://localhost:5111"
 ORCH_ORDER_URL="http://localhost:5201"
 ORCH_SAGA_URL="http://localhost:5200"
 RABBITMQ_API="http://localhost:15672"
@@ -32,6 +34,7 @@ RABBITMQ_API="http://localhost:15672"
 PASSED=0
 FAILED=0
 SKIP_CHOR=false
+SKIP_OUTBOX=false
 SKIP_ORCH=false
 
 # ─── Couleurs ──────────────────────────────────────────────────────────────────
@@ -124,8 +127,9 @@ wait_for_service() {
 }
 
 # ─── Helpers Docker Compose ────────────────────────────────────────────────────
-dc_chor() { docker compose -f "$CHOR_DIR/docker-compose.yml" --project-directory "$CHOR_DIR" "$@" 2>/dev/null; }
-dc_orch() { docker compose -f "$ORCH_DIR/docker-compose.yml" --project-directory "$ORCH_DIR" "$@" 2>/dev/null; }
+dc_chor()   { docker compose -f "$CHOR_DIR/docker-compose.yml"   --project-directory "$CHOR_DIR"   "$@" 2>/dev/null; }
+dc_outbox() { docker compose -f "$OUTBOX_DIR/docker-compose.yml" --project-directory "$OUTBOX_DIR" "$@" 2>/dev/null; }
+dc_orch()   { docker compose -f "$ORCH_DIR/docker-compose.yml"   --project-directory "$ORCH_DIR"   "$@" 2>/dev/null; }
 
 # ─── Helpers RabbitMQ ──────────────────────────────────────────────────────────
 
@@ -395,6 +399,255 @@ run_chor_c4_compensation_failure() {
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
+# CHORÉGRAPHIE + OUTBOX (Phase 1b) — Tests de chaos
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# Ces 4 tests reprennent les mêmes scénarios que Phase 1a pour permettre une
+# comparaison directe. Les deux tests distinctifs sont :
+#   C3 — Protection dual-write  : simulateCrash=true → saga converge quand même
+#   C4 — Résilience au redémarrage : SQLite préserve l'état (vs mémoire en 1a)
+
+# C1 — Service down : stock-service arrêté (même scénario que 1a)
+# ─────────────────────────────────────────────────────────────────────────────
+# Comportement attendu : identique à 1a — RabbitMQ conserve les messages.
+# Différence notable : order-service lui-même peut redémarrer sans perdre l'état.
+run_outbox_c1_service_down() {
+  log_section "OUTBOX — C1 : Service down (stock-service) — parité avec 1a"
+  echo "  Même scénario qu'en Phase 1a. Après redémarrage de stock-service,"
+  echo "  la saga se termine. L'état persiste en SQLite (pas en mémoire)."
+
+  log_info "Création d'une commande (qty=5)..."
+  local resp
+  resp=$(post_order "$OUTBOX_ORDER_URL" 5)
+  local order_id
+  order_id=$(echo "$resp" | extract_id)
+
+  if [[ -z "$order_id" ]]; then
+    log_fail "Impossible de créer une commande — service non disponible"
+    return
+  fi
+  log_info "Commande créée : $order_id"
+
+  log_info "Arrêt de stock-service..."
+  dc_outbox stop stock-service
+
+  sleep 3
+  local status
+  status=$(get_order_status "$OUTBOX_ORDER_URL" "$order_id" || echo "unknown")
+  log_info "Statut avec stock-service arrêté : ${status:-unknown}"
+
+  if [[ "$status" == "PENDING" ]]; then
+    log_pass "PENDING confirmé — OrderCreated conservé dans RabbitMQ"
+    log_hint "Même comportement qu'en 1a : le broker absorbe l'indisponibilité du consumer"
+  else
+    log_warn "Statut inattendu : $status (saga peut-être traitée avant l'arrêt)"
+  fi
+
+  log_info "Redémarrage de stock-service..."
+  dc_outbox start stock-service
+
+  log_info "Attente de la résolution de la saga (max 40s)..."
+  local final
+  if final=$(wait_for_terminal "$OUTBOX_ORDER_URL" "$order_id" 40); then
+    log_pass "Saga résolue après redémarrage → statut : $final"
+    log_hint "Même résilience qu'en 1a — mais l'état survit aussi à un crash d'order-service"
+  else
+    log_fail "La saga n'a pas convergé dans les 40s après redémarrage"
+  fi
+}
+
+# C2 — Timeout simulé : payment-service gelé via docker pause
+# ─────────────────────────────────────────────────────────────────────────────
+# Comportement attendu : identique à Phase 1a.
+run_outbox_c2_timeout_pause() {
+  log_section "OUTBOX — C2 : Timeout simulé (payment-service gelé)"
+  echo "  'docker pause' suspend payment-service. StockReserved attend dans"
+  echo "  la queue. Après unpause, la saga se termine normalement."
+
+  log_info "Création d'une commande (qty=5)..."
+  local resp
+  resp=$(post_order "$OUTBOX_ORDER_URL" 5)
+  local order_id
+  order_id=$(echo "$resp" | extract_id)
+
+  if [[ -z "$order_id" ]]; then
+    log_fail "Impossible de créer une commande"
+    return
+  fi
+  log_info "Commande créée : $order_id"
+
+  sleep 1
+  log_info "Gel de payment-service (docker pause)..."
+  dc_outbox pause payment-service
+
+  sleep 5
+  local status
+  status=$(get_order_status "$OUTBOX_ORDER_URL" "$order_id" || echo "unknown")
+  log_info "Statut avec payment-service gelé : ${status:-unknown}"
+
+  if [[ "$status" != "CONFIRMED" && "$status" != "CANCELLED" ]]; then
+    log_pass "Saga bloquée (${status:-PENDING}) — paiement en attente dans la queue"
+    log_hint "Même comportement qu'en 1a — l'outbox ne change pas la latence de traitement"
+  else
+    log_warn "Saga déjà résolue avant le gel ($status) — fenêtre trop tardive"
+  fi
+
+  log_info "Reprise de payment-service (docker unpause)..."
+  dc_outbox unpause payment-service
+
+  log_info "Attente de la résolution (max 30s)..."
+  local final
+  if final=$(wait_for_terminal "$OUTBOX_ORDER_URL" "$order_id" 30); then
+    log_pass "Saga résolue après reprise → statut : $final"
+  else
+    log_fail "La saga n'a pas été résolue après unpause dans les 30s"
+  fi
+}
+
+# C3 — Protection dual-write : ?simulateCrash=true
+# ─────────────────────────────────────────────────────────────────────────────
+# DIFFÉRENCIATEUR PRINCIPAL entre Phase 1a et Phase 1b.
+#
+# Phase 1a :
+#   - La commande est sauvée en mémoire mais l'événement n'est PAS publié
+#   - La saga reste bloquée en PENDING indéfiniment
+#
+# Phase 1b (Outbox) :
+#   - Crash simulé APRÈS l'écriture atomique (Order + OutboxMessage en une transaction)
+#   - L'OutboxPollerService détecte le message non traité et le publie (max 2s de délai)
+#   - La saga converge normalement → CONFIRMED ou CANCELLED
+run_outbox_c3_dual_write() {
+  log_section "OUTBOX — C3 : Protection dual-write (simulateCrash=true)"
+  echo "  ?simulateCrash=true simule un crash après la sauvegarde."
+  echo "  Phase 1a → l'événement n'est jamais publié → PENDING indéfiniment."
+  echo "  Phase 1b → l'OutboxPoller reprend la livraison → saga converge."
+
+  # ── Phase 1b : avec Outbox ─────────────────────────────────────────────────
+  log_info "[1b] Envoi de POST /orders?simulateCrash=true..."
+  local resp_1b
+  resp_1b=$(curl -sf --max-time 10 -X POST "$OUTBOX_ORDER_URL/orders?simulateCrash=true" \
+    -H "Content-Type: application/json" \
+    -d '{"productId":"PROD-CRASH","quantity":5}' 2>/dev/null || echo "")
+  local id_1b
+  id_1b=$(echo "$resp_1b" | extract_id)
+
+  if [[ -z "$id_1b" ]]; then
+    log_fail "[1b] Impossible de créer la commande (service non disponible ?)"
+  else
+    log_info "[1b] Commande créée : $id_1b — attente de l'OutboxPoller (max 30s)..."
+    local final_1b
+    if final_1b=$(wait_for_terminal "$OUTBOX_ORDER_URL" "$id_1b" 30); then
+      log_pass "[1b] Saga résolue → $final_1b (OutboxPoller a publié l'événement après le crash simulé)"
+      log_hint "L'écriture atomique (BDD + Outbox) garantit qu'aucun événement n'est perdu"
+    else
+      local stuck
+      stuck=$(get_order_status "$OUTBOX_ORDER_URL" "$id_1b" || echo "unknown")
+      log_fail "[1b] Saga toujours bloquée en ${stuck:-PENDING} après 30s — vérifier l'OutboxPoller"
+    fi
+  fi
+
+  # ── Phase 1a : sans Outbox (comparaison) ──────────────────────────────────
+  if service_is_reachable "$CHOR_ORDER_URL/orders"; then
+    log_info "[1a] Envoi de POST /orders?simulateCrash=true (comparaison)..."
+    local resp_1a
+    resp_1a=$(curl -sf --max-time 10 -X POST "$CHOR_ORDER_URL/orders?simulateCrash=true" \
+      -H "Content-Type: application/json" \
+      -d '{"productId":"PROD-CRASH","quantity":5}' 2>/dev/null || echo "")
+    local id_1a
+    id_1a=$(echo "$resp_1a" | extract_id)
+
+    if [[ -n "$id_1a" ]]; then
+      sleep 15
+      local status_1a
+      status_1a=$(get_order_status "$CHOR_ORDER_URL" "$id_1a" || echo "unknown")
+      if [[ "$status_1a" == "PENDING" ]]; then
+        log_pass "[1a] Toujours PENDING après 15s — dual-write problem confirmé (attendu)"
+        log_hint "Sans Outbox, le crash simulé laisse la saga bloquée définitivement"
+      else
+        log_warn "[1a] Statut inattendu : $status_1a (attendu : PENDING)"
+      fi
+    else
+      log_warn "[1a] Impossible de créer la commande 1a (ignoré)"
+    fi
+  else
+    log_warn "[1a] Phase 1a non disponible — comparaison ignorée"
+    log_hint "Démarrer : cd Saga-Choreography && docker compose up -d"
+  fi
+}
+
+# C4 — Résilience au redémarrage : SQLite préserve l'état (vs mémoire en 1a)
+# ─────────────────────────────────────────────────────────────────────────────
+# DIFFÉRENCIATEUR Phase 1b vs 1a.
+#
+# Phase 1a (C4) : order-service redémarre → état mémoire vide →
+#   - StockReservationFailed ne peut pas être consommé → dead-letter
+#   - La commande reste introuvable dans le nouvel état
+#
+# Phase 1b (C4) : order-service redémarre → SQLite intact →
+#   - StockReservationFailed est consommé normalement → commande CANCELLED
+#   - La compensation réussit, pas de dead-letter
+run_outbox_c4_restart_resilience() {
+  log_section "OUTBOX — C4 : Résilience au redémarrage (SQLite vs mémoire)"
+  echo "  qty=200 → stock refuse → StockReservationFailed publié."
+  echo "  order-service redémarre : En 1a → compensation échoue (état perdu)."
+  echo "  En 1b → SQLite préserve l'état → compensation CANCELLED proprement."
+
+  local errors_before
+  errors_before=$(count_error_queues)
+  log_info "Error queues avant le test : $errors_before"
+
+  log_info "Création d'une commande qty=200 (échec stock déterministe)..."
+  local resp
+  resp=$(post_order "$OUTBOX_ORDER_URL" 200)
+  local order_id
+  order_id=$(echo "$resp" | extract_id)
+
+  if [[ -z "$order_id" ]]; then
+    log_fail "Impossible de créer la commande"
+    return
+  fi
+  log_info "Commande créée : $order_id"
+
+  log_info "Arrêt immédiat de order-service (avant la compensation)..."
+  dc_outbox stop order-service
+
+  log_info "Pause 4s — stock-service publie StockReservationFailed..."
+  sleep 4
+
+  log_info "Redémarrage de order-service (état SQLite intact)..."
+  dc_outbox start order-service
+  wait_for_service "$OUTBOX_ORDER_URL" 30 || true
+
+  log_info "Attente de la compensation (max 30s)..."
+  local final
+  if final=$(wait_for_terminal "$OUTBOX_ORDER_URL" "$order_id" 30); then
+    if [[ "$final" == "CANCELLED" ]]; then
+      log_pass "Commande CANCELLED après redémarrage — SQLite a préservé l'état"
+      log_hint "Contraste avec 1a : ici la compensation réussit car l'ordre est toujours en BDD"
+    else
+      log_warn "Statut inattendu : $final (attendu : CANCELLED)"
+    fi
+  else
+    local stuck
+    stuck=$(get_order_status "$OUTBOX_ORDER_URL" "$order_id" || echo "unknown")
+    log_fail "Saga non résolue après redémarrage — statut : ${stuck:-unknown}"
+  fi
+
+  local errors_after
+  errors_after=$(count_error_queues)
+  if (( errors_after > errors_before )); then
+    log_warn "Dead-letter détecté ($errors_after queues) — vérifier que le consumer est idempotent"
+    log_hint "http://localhost:15672 (guest/guest)"
+  else
+    log_pass "Aucune dead-letter — la compensation a réussi sans épuiser les tentatives"
+  fi
+
+  echo
+  echo "  CONSTAT : Avec SQLite, l'état survit aux redémarrages."
+  echo "  L'OutboxPoller garantit aussi qu'aucun événement sortant n'est perdu."
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
 # ORCHESTRATION — Tests de chaos
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -628,15 +881,17 @@ run_orch_c4_compensation_failure() {
 
 usage() {
   cat <<EOF
-Usage: $0 [all|choreography|orchestration]
+Usage: $0 [all|choreography|1a|outbox|1b|orchestration|2]
 
   all              Exécute tous les tests chaos (défaut)
-  choreography     Phase 1 — SAGA Chorégraphiée (RabbitMQ · ports 5101-5103)
-  orchestration    Phase 2 — SAGA Orchestrée   (Temporal · ports 5200-5203)
+  choreography|1a  Phase 1a — SAGA Chorégraphiée sans Outbox  (ports 5101-5103)
+  outbox|1b        Phase 1b — SAGA Chorégraphiée + Outbox      (ports 5111-5113)
+  orchestration|2  Phase 2  — SAGA Orchestrée (Temporal)       (ports 5200-5203)
 
 Prérequis — services démarrés avec 'docker compose up -d' :
-  Phase 1 : cd Saga-Choreography && docker compose up -d
-  Phase 2 : cd Saga-Orchestration && docker compose up -d
+  Phase 1a : cd Saga-Choreography        && docker compose up -d
+  Phase 1b : cd Saga-Choreography-Outbox && docker compose up -d
+  Phase 2  : cd Saga-Orchestration       && docker compose up -d
 EOF
   exit 0
 }
@@ -644,18 +899,27 @@ EOF
 check_prereqs() {
   local target="$1"
 
-  if [[ "$target" == "all" || "$target" == "choreography" ]]; then
+  if [[ "$target" == "all" || "$target" == "choreography" || "$target" == "1a" ]]; then
     if ! service_is_reachable "$CHOR_ORDER_URL/orders"; then
-      echo -e "${RED}[ERREUR]${NC} Saga-Choreography non disponible ($CHOR_ORDER_URL)"
+      echo -e "${RED}[ERREUR]${NC} Saga-Choreography (1a) non disponible ($CHOR_ORDER_URL)"
       echo "  → cd Saga-Choreography && docker compose up -d"
       [[ "$target" != "all" ]] && exit 1
       SKIP_CHOR=true
     fi
   fi
 
-  if [[ "$target" == "all" || "$target" == "orchestration" ]]; then
+  if [[ "$target" == "all" || "$target" == "outbox" || "$target" == "1b" ]]; then
+    if ! service_is_reachable "$OUTBOX_ORDER_URL/orders"; then
+      echo -e "${RED}[ERREUR]${NC} Saga-Choreography-Outbox (1b) non disponible ($OUTBOX_ORDER_URL)"
+      echo "  → cd Saga-Choreography-Outbox && docker compose up -d"
+      [[ "$target" != "all" ]] && exit 1
+      SKIP_OUTBOX=true
+    fi
+  fi
+
+  if [[ "$target" == "all" || "$target" == "orchestration" || "$target" == "2" ]]; then
     if ! service_is_reachable "$ORCH_SAGA_URL"; then
-      echo -e "${RED}[ERREUR]${NC} Saga-Orchestration non disponible ($ORCH_SAGA_URL)"
+      echo -e "${RED}[ERREUR]${NC} Saga-Orchestration (2) non disponible ($ORCH_SAGA_URL)"
       echo "  → cd Saga-Orchestration && docker compose up -d"
       [[ "$target" != "all" ]] && exit 1
       SKIP_ORCH=true
@@ -671,8 +935,13 @@ print_banner() {
   echo
   echo "  C1 — Service down pendant une saga en cours"
   echo "  C2 — Timeout inter-service (docker pause / StartToCloseTimeout)"
-  echo "  C3 — Message dupliqué / workflows concurrents"
-  echo "  C4 — Compensation qui échoue (dead-letter / MaxAttempts=1)"
+  echo "  C3 — Message dupliqué / dual-write (protection Outbox en 1b)"
+  echo "  C4 — Compensation / résilience au redémarrage (SQLite vs mémoire)"
+  echo
+  echo "  Phases couvertes :"
+  echo "    1a — SAGA Chorégraphiée sans Outbox  (ports 5101-5103)"
+  echo "    1b — SAGA Chorégraphiée + Outbox     (ports 5111-5113)"
+  echo "    2  — SAGA Orchestrée   (Temporal)    (ports 5200-5203)"
   echo
 }
 
@@ -697,25 +966,34 @@ main() {
   local target="${1:-all}"
   case "$target" in
     -h|--help|help) usage ;;
-    all|choreography|orchestration) ;;
+    all|choreography|1a|outbox|1b|orchestration|2) ;;
     *) echo -e "${RED}Option inconnue : '$target'${NC}" >&2; usage ;;
   esac
 
   print_banner
   check_prereqs "$target"
 
-  # ── Phase 1 : Chorégraphie ─────────────────────────────────────────────────
-  if [[ ( "$target" == "all" || "$target" == "choreography" ) && "$SKIP_CHOR" != "true" ]]; then
-    echo -e "\n${BOLD}${CYAN}▶▶▶  PHASE 1 — SAGA CHORÉGRAPHIÉE (RabbitMQ / MassTransit)${NC}"
+  # ── Phase 1a : Chorégraphie sans Outbox ───────────────────────────────────
+  if [[ ( "$target" == "all" || "$target" == "choreography" || "$target" == "1a" ) && "$SKIP_CHOR" != "true" ]]; then
+    echo -e "\n${BOLD}${CYAN}▶▶▶  PHASE 1a — SAGA CHORÉGRAPHIÉE sans Outbox (RabbitMQ / MassTransit · 5101-5103)${NC}"
     run_chor_c1_service_down
     run_chor_c2_timeout_pause
     run_chor_c3_duplicate
     run_chor_c4_compensation_failure
   fi
 
+  # ── Phase 1b : Chorégraphie + Outbox ──────────────────────────────────────
+  if [[ ( "$target" == "all" || "$target" == "outbox" || "$target" == "1b" ) && "$SKIP_OUTBOX" != "true" ]]; then
+    echo -e "\n${BOLD}${CYAN}▶▶▶  PHASE 1b — SAGA CHORÉGRAPHIÉE + Transactional Outbox (MassTransit · 5111-5113)${NC}"
+    run_outbox_c1_service_down
+    run_outbox_c2_timeout_pause
+    run_outbox_c3_dual_write
+    run_outbox_c4_restart_resilience
+  fi
+
   # ── Phase 2 : Orchestration ────────────────────────────────────────────────
-  if [[ ( "$target" == "all" || "$target" == "orchestration" ) && "$SKIP_ORCH" != "true" ]]; then
-    echo -e "\n${BOLD}${CYAN}▶▶▶  PHASE 2 — SAGA ORCHESTRÉE (Temporal)${NC}"
+  if [[ ( "$target" == "all" || "$target" == "orchestration" || "$target" == "2" ) && "$SKIP_ORCH" != "true" ]]; then
+    echo -e "\n${BOLD}${CYAN}▶▶▶  PHASE 2 — SAGA ORCHESTRÉE (Temporal · 5200-5203)${NC}"
     run_orch_c1_service_down
     run_orch_c2_timeout_pause
     run_orch_c3_concurrent

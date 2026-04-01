@@ -1,0 +1,62 @@
+services:
+  rabbitmq:
+    image: rabbitmq:4-management
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    environment:
+      RABBITMQ_DEFAULT_USER: guest
+      RABBITMQ_DEFAULT_PASS: guest
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  order-service:
+    build:
+      context: ./src
+      dockerfile: OrderService/Dockerfile
+    ports:
+      - "5111:8080"
+    environment:
+      - ASPNETCORE_ENVIRONMENT=Development
+      - RabbitMq__Host=rabbitmq
+      - ConnectionStrings__Orders=Data Source=/data/orders.db
+    volumes:
+      - order-data:/data
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    restart: on-failure
+
+  stock-service:
+    build:
+      context: ./src
+      dockerfile: StockService/Dockerfile
+    ports:
+      - "5112:8080"
+    environment:
+      - ASPNETCORE_ENVIRONMENT=Development
+      - RabbitMq__Host=rabbitmq
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    restart: on-failure
+
+  payment-service:
+    build:
+      context: ./src
+      dockerfile: PaymentService/Dockerfile
+    ports:
+      - "5113:8080"
+    environment:
+      - ASPNETCORE_ENVIRONMENT=Development
+      - RabbitMq__Host=rabbitmq
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    restart: on-failure
+
+volumes:
+  order-data:

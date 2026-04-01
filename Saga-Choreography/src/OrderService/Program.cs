@@ -21,14 +21,25 @@ builder.Services.AddMassTransit(x =>
 var app = builder.Build();
 
 // POST /orders — Crée une commande et publie OrderCreated
-app.MapPost("/orders", async (CreateOrderRequest request, IPublishEndpoint publish) =>
+// ?simulateCrash=true : sauvegarde en mémoire mais n'envoie PAS l'événement → démontre le dual-write problem
+app.MapPost("/orders", async (CreateOrderRequest request, IPublishEndpoint publish,
+    [Microsoft.AspNetCore.Mvc.FromQuery] bool simulateCrash = false) =>
 {
     var order = new Order(Guid.NewGuid(), request.ProductId, request.Quantity, "PENDING");
     OrderStore.Orders[order.Id] = order;
-
     Console.WriteLine($"[Order] Commande {order.Id} créée (PENDING)");
-    await publish.Publish(new OrderCreated(order.Id, order.ProductId, order.Quantity));
 
+    if (simulateCrash)
+    {
+        // [PHASE 1a — DUAL-WRITE PROBLEM]
+        // La commande est en BDD (mémoire) mais l'événement n'atteint JAMAIS RabbitMQ.
+        // La saga ne démarre pas : OrderId reste PENDING indéfiniment.
+        Console.WriteLine($"[Order][CHAOS] ⚠ Crash simulé avant publication → {order.Id} restera PENDING indéfiniment !");
+        return Results.Created($"/orders/{order.Id}",
+            new { order, chaos = "CRASH simulé : événement NON publié — saga bloquée (dual-write problem)" });
+    }
+
+    await publish.Publish(new OrderCreated(order.Id, order.ProductId, order.Quantity));
     return Results.Created($"/orders/{order.Id}", order);
 });
 
