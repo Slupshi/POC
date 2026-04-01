@@ -115,7 +115,7 @@ POC/Api/transactions/
 
 - Forker `Saga-Choreography/` vers `Saga-Choreography-Outbox/`
 - Activer l'Outbox MassTransit via `AddEntityFrameworkOutbox` dans chaque service producteur
-- Ajouter la table `OutboxMessage` (migration EF Core) dans la même BDD que le domaine
+- Ajouter la table `OutboxMessage` (migration EF Core) dans la même BDD que le domaine, ici la base de données est simulée par SQLite
 - Vérifier que l'envoi de l'événement et l'écriture métier sont dans la **même transaction locale**
 - Simuler un crash entre la sauvegarde BDD et la publication : valider qu'aucun message n'est perdu
 - Comparer le comportement avec la Phase 1a lors des tests de chaos
