@@ -1,0 +1,16 @@
+@OrderService_HostAddress = http://localhost:5201
+
+### Créer une commande (happy path)
+POST {{OrderService_HostAddress}}/orders
+Content-Type: application/json
+
+{
+  "productId": "PROD-001",
+  "quantity": 5
+}
+
+### Lister les commandes
+GET {{OrderService_HostAddress}}/orders
+Accept: application/json
+
+###

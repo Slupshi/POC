@@ -1,0 +1,21 @@
+@StockService_HostAddress = http://localhost:5202
+
+### Réserver du stock
+POST {{StockService_HostAddress}}/stock/reserve
+Content-Type: application/json
+
+{
+  "orderId": "00000000-0000-0000-0000-000000000001",
+  "productId": "PROD-001",
+  "quantity": 5
+}
+
+### Libérer du stock (compensation)
+POST {{StockService_HostAddress}}/stock/release
+Content-Type: application/json
+
+{
+  "orderId": "00000000-0000-0000-0000-000000000001"
+}
+
+###

@@ -1,0 +1,13 @@
+{
+  "version": 2,
+  "dgSpecHash": "G5t8MinWBcE=",
+  "success": true,
+  "projectFilePath": "D:\\WS\\LEOscan\\POC\\Transactions\\POC\\Saga-Choreography\\src\\PaymentService\\PaymentService.csproj",
+  "expectedPackageFiles": [
+    "C:\\Users\\Kemora\\.nuget\\packages\\masstransit\\8.4.0\\masstransit.8.4.0.nupkg.sha512",
+    "C:\\Users\\Kemora\\.nuget\\packages\\masstransit.abstractions\\8.4.0\\masstransit.abstractions.8.4.0.nupkg.sha512",
+    "C:\\Users\\Kemora\\.nuget\\packages\\masstransit.rabbitmq\\8.4.0\\masstransit.rabbitmq.8.4.0.nupkg.sha512",
+    "C:\\Users\\Kemora\\.nuget\\packages\\rabbitmq.client\\7.1.2\\rabbitmq.client.7.1.2.nupkg.sha512"
+  ],
+  "logs": []
+}

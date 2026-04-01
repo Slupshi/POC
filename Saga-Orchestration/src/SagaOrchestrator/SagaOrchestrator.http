@@ -1,0 +1,25 @@
+@SagaOrchestrator_HostAddress = http://localhost:5200
+
+### Happy path — Créer commande via saga (quantité ≤ 100)
+POST {{SagaOrchestrator_HostAddress}}/saga/orders
+Content-Type: application/json
+
+{
+  "productId": "PROD-001",
+  "quantity": 5
+}
+
+### Échec stock — quantité > 100
+POST {{SagaOrchestrator_HostAddress}}/saga/orders
+Content-Type: application/json
+
+{
+  "productId": "PROD-001",
+  "quantity": 200
+}
+
+### Vérifier les commandes (via OrderService)
+GET http://localhost:5201/orders
+Accept: application/json
+
+###
